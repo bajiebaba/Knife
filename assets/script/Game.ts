@@ -1,0 +1,393 @@
+import {
+    _decorator,
+    Component,
+    Node,
+    Prefab,
+    instantiate,
+    input,
+    Input,
+    EventTouch,
+    Vec3,
+    Label,
+    Collider2D,
+} from 'cc';
+const { ccclass, property } = _decorator;
+
+enum RoundState {
+    Idle = 'Idle',
+    KnifeFlying = 'KnifeFlying',
+    RoundWin = 'RoundWin',
+    RoundFail = 'RoundFail',
+}
+
+@ccclass('Game')
+export class Game extends Component {
+    @property({ type: Node, tooltip: '上半屏中间的轮盘节点' })
+    public wheel: Node | null = null;
+
+    @property({ type: Node, tooltip: '下半屏中间的飞刀出生点节点' })
+    public knifeSpawnPoint: Node | null = null;
+
+    @property({ type: Prefab, tooltip: '飞刀预制体（同一个预制体用于待发与已附着飞刀）' })
+    public knifePrefab: Prefab | null = null;
+
+    @property({ type: Node, tooltip: '飞刀父节点容器（不填则默认使用当前 Game 节点）' })
+    public knifeLayer: Node | null = null;
+
+    @property({ type: Label, tooltip: '进度文本（可选）：例如 3/8' })
+    public progressLabel: Label | null = null;
+
+    @property({ type: Node, tooltip: '胜利面板（可选）' })
+    public winPanel: Node | null = null;
+
+    @property({ type: Node, tooltip: '失败面板（可选）' })
+    public failPanel: Node | null = null;
+
+    @property({ type: Node, tooltip: '胜利面板中的继续游戏按钮（可选）' })
+    public winContinueButton: Node | null = null;
+
+    @property({ type: Node, tooltip: '失败面板中的继续游戏按钮（可选）' })
+    public failContinueButton: Node | null = null;
+
+    @property({ tooltip: '本局目标飞刀数量' })
+    public targetKnifeCount = 8;
+
+    @property({ tooltip: '轮盘旋转速度（角度/秒）' })
+    public wheelRotateSpeed = 120;
+
+    @property({ tooltip: '飞刀上升速度（像素/秒）' })
+    public knifeFlySpeed = 1200;
+
+    @property({ tooltip: '轮盘附着半径（像素）' })
+    public wheelAttachRadius = 120;
+
+    @property({ tooltip: '飞刀碰撞半径（像素）' })
+    public knifeCollisionRadius = 20;
+
+    @property({ tooltip: '飞刀超过轮盘上边缘后的失败冗余距离（像素）' })
+    public missYMargin = 120;
+
+    @property({ tooltip: '飞刀附着后的角度偏移（度），默认 90 可避免刀尖刀柄反转' })
+    public attachedKnifeAngleOffset = 90;
+
+    private roundState: RoundState = RoundState.Idle;
+    private currentKnife: Node | null = null;
+    private attachedKnives: Node[] = [];
+    // 仅用于“失败瞬间保留失误飞刀显示”：
+    // 这些节点会在下一局开始时统一销毁，避免跨局残留污染场景。
+    private failedDisplayKnives: Node[] = [];
+    private hitKnifeCount = 0;
+    private wheelCollider: Collider2D | null = null;
+
+    // 为了避免“点击继续游戏”后同一触摸事件立刻触发发射，这里增加一个极短输入锁。
+    private elapsedSeconds = 0;
+    private inputLockedUntil = 0;
+
+    // 复用临时向量，避免在 update 中频繁创建对象导致 GC 抖动。
+    private readonly tempA = new Vec3();
+    private readonly tempB = new Vec3();
+    private readonly tempC = new Vec3();
+
+    start() {
+        this.bindInputEvents();
+        this.cacheColliders();
+        this.startNewRound();
+    }
+
+    update(deltaTime: number) {
+        this.elapsedSeconds += deltaTime;
+
+        // 仅在“可进行中”的状态旋转轮盘；结算状态下保持静止，便于玩家看清结果。
+        if ((this.roundState === RoundState.Idle || this.roundState === RoundState.KnifeFlying) && this.wheel) {
+            this.wheel.angle += this.wheelRotateSpeed * deltaTime;
+        }
+
+        if (this.roundState === RoundState.KnifeFlying) {
+            this.updateFlyingKnife(deltaTime);
+        }
+    }
+
+    onDestroy() {
+        input.off(Input.EventType.TOUCH_END, this.onGlobalTouchEnd, this);
+        this.winContinueButton?.off(Node.EventType.TOUCH_END, this.onContinueGame, this);
+        this.failContinueButton?.off(Node.EventType.TOUCH_END, this.onContinueGame, this);
+    }
+
+    private bindInputEvents() {
+        input.on(Input.EventType.TOUCH_END, this.onGlobalTouchEnd, this);
+        this.winContinueButton?.on(Node.EventType.TOUCH_END, this.onContinueGame, this);
+        this.failContinueButton?.on(Node.EventType.TOUCH_END, this.onContinueGame, this);
+    }
+
+    private onGlobalTouchEnd(_event: EventTouch) {
+        if (this.elapsedSeconds < this.inputLockedUntil) {
+            return;
+        }
+        if (this.roundState !== RoundState.Idle) {
+            return;
+        }
+        this.throwCurrentKnife();
+    }
+
+    private onContinueGame() {
+        this.startNewRound();
+    }
+
+    private startNewRound() {
+        if (!this.wheel || !this.knifeSpawnPoint || !this.knifePrefab) {
+            console.warn('[Game] 请先在编辑器中绑定 wheel / knifeSpawnPoint / knifePrefab。');
+            return;
+        }
+        this.cacheColliders();
+
+        // 1) 清理旧局残留的飞刀（包括正在飞行和已附着）。
+        if (this.currentKnife && this.currentKnife.isValid) {
+            this.currentKnife.destroy();
+        }
+        this.currentKnife = null;
+        for (const knife of this.attachedKnives) {
+            if (knife && knife.isValid) {
+                knife.destroy();
+            }
+        }
+        this.attachedKnives.length = 0;
+        for (const knife of this.failedDisplayKnives) {
+            if (knife && knife.isValid) {
+                knife.destroy();
+            }
+        }
+        this.failedDisplayKnives.length = 0;
+
+        // 2) 重置计数、状态、界面可见性。
+        this.hitKnifeCount = 0;
+        this.roundState = RoundState.Idle;
+        if (this.wheel) {
+            this.wheel.angle = 0;
+        }
+        if (this.winPanel) {
+            this.winPanel.active = false;
+        }
+        if (this.failPanel) {
+            this.failPanel.active = false;
+        }
+        this.refreshProgressText();
+
+        // 3) 生成第一把待发飞刀，并短暂锁输入，避免触摸事件串扰导致误发射。
+        this.spawnWaitingKnife();
+        this.inputLockedUntil = this.elapsedSeconds + 0.1;
+    }
+
+    private spawnWaitingKnife() {
+        if (!this.knifePrefab || !this.knifeSpawnPoint) {
+            return;
+        }
+
+        const knife = instantiate(this.knifePrefab);
+        const runtimeKnifeLayer = this.knifeLayer ?? this.knifeSpawnPoint.parent ?? this.node;
+        knife.setParent(runtimeKnifeLayer);
+
+        // 关键修复：
+        // 1) 默认把飞刀放到与 spawnPoint 同一层级空间，避免因父节点不在 UI 渲染树而“逻辑存在但画面看不到”；
+        // 2) 若父节点一致，直接用本地坐标可避免不必要的世界坐标换算误差；
+        // 3) 若父节点不同，再回退到世界坐标设置，保证位置正确。
+        if (runtimeKnifeLayer === this.knifeSpawnPoint.parent) {
+            knife.setPosition(this.knifeSpawnPoint.position);
+        } else {
+            knife.setWorldPosition(this.knifeSpawnPoint.worldPosition);
+        }
+
+        // 显式激活并置于同层最前，确保“待发飞刀可见”和“发射过程可观察”。
+        knife.active = true;
+        knife.setSiblingIndex(knife.parent ? knife.parent.children.length - 1 : 0);
+        knife.angle = 0;
+        this.currentKnife = knife;
+    }
+
+    private throwCurrentKnife() {
+        if (!this.currentKnife) {
+            return;
+        }
+        this.roundState = RoundState.KnifeFlying;
+    }
+
+    private cacheColliders() {
+        this.wheelCollider = this.wheel?.getComponent(Collider2D) ?? null;
+        if (!this.wheelCollider) {
+            console.warn('[Game] wheel 节点缺少 Collider2D，无法进行“飞刀 vs 轮盘”的碰撞判定。');
+        }
+    }
+
+    private getKnifeCollider(knife: Node | null): Collider2D | null {
+        if (!knife || !knife.isValid) {
+            return null;
+        }
+        return knife.getComponent(Collider2D);
+    }
+
+    private isColliderOverlap(a: Collider2D | null, b: Collider2D | null): boolean {
+        if (!a || !b || !a.enabledInHierarchy || !b.enabledInHierarchy) {
+            return false;
+        }
+        return a.worldAABB.intersects(b.worldAABB);
+    }
+
+    private checkKnifeHitAttachedByCollider(): boolean {
+        const flyingKnifeCollider = this.getKnifeCollider(this.currentKnife);
+        if (!flyingKnifeCollider) {
+            return false;
+        }
+
+        // 使用对象自身 Collider2D 做判定：只要“当前飞刀”与任意已附着飞刀的碰撞盒发生交叠，即判定失败。
+        for (const attachedKnife of this.attachedKnives) {
+            if (!attachedKnife || !attachedKnife.isValid) {
+                continue;
+            }
+            const attachedKnifeCollider = this.getKnifeCollider(attachedKnife);
+            if (this.isColliderOverlap(flyingKnifeCollider, attachedKnifeCollider)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private checkKnifeHitWheelByCollider(): boolean {
+        const flyingKnifeCollider = this.getKnifeCollider(this.currentKnife);
+        if (!flyingKnifeCollider || !this.wheelCollider) {
+            return false;
+        }
+        // 使用对象自身 Collider2D 做判定：飞刀与轮盘发生碰撞盒交叠，即视作命中轮盘。
+        return this.isColliderOverlap(flyingKnifeCollider, this.wheelCollider);
+    }
+
+    private updateFlyingKnife(deltaTime: number) {
+        if (!this.currentKnife || !this.currentKnife.isValid || !this.wheel) {
+            this.failRound();
+            return;
+        }
+
+        // 记录移动前坐标，用于做“跨帧穿越检测”。
+        this.currentKnife.getWorldPosition(this.tempA);
+        this.tempB.set(this.tempA);
+
+        // 飞刀每帧沿世界 Y 轴正方向直线移动，符合“掷出后直线向上”的规则。
+        this.tempB.y += this.knifeFlySpeed * deltaTime;
+        this.currentKnife.setWorldPosition(this.tempB);
+
+        // 按规则优先检查“飞刀撞已附着飞刀”的失败条件。
+        if (this.checkKnifeHitAttachedByCollider()) {
+            // 按需求：新飞刀撞到老飞刀时，新飞刀应保留在碰撞瞬间的位置，不做销毁。
+            // 这里传 false，进入失败结算但不 destroy 当前飞刀，让画面反馈更直观。
+            this.failRound(false);
+            return;
+        }
+
+        // 再检查“飞刀撞轮盘”的成功条件，命中后立刻附着并进入下一把飞刀流程。
+        if (this.checkKnifeHitWheelByCollider()) {
+            this.attachCurrentKnifeToWheelByCurrentWorldPos();
+            return;
+        }
+
+        // 兜底：若碰撞组件配置异常或极端速度导致漏检，飞刀越过轮盘后仍会失败，避免游戏卡在飞行状态。
+        if (this.isKnifeMissedWheel(this.tempB)) {
+            this.failRound();
+        }
+    }
+
+    private isKnifeMissedWheel(currWorldPos: Vec3): boolean {
+        if (!this.wheel) {
+            return false;
+        }
+
+        this.wheel.getWorldPosition(this.tempC);
+        const overTopY = this.tempC.y + this.wheelAttachRadius + this.missYMargin;
+        if (currWorldPos.y > overTopY) {
+            return true;
+        }
+
+        // 如果 X 已明显偏离轮盘且飞刀已经飞到轮盘中心以上，也视为本次不可能命中，提前失败可避免拖帧和卡状态。
+        const impossibleHitX = Math.abs(currWorldPos.x - this.tempC.x) > this.wheelAttachRadius + this.knifeCollisionRadius;
+        return impossibleHitX && currWorldPos.y >= this.tempC.y;
+    }
+
+    private attachCurrentKnifeToWheelByCurrentWorldPos() {
+        if (!this.currentKnife || !this.wheel) {
+            return;
+        }
+
+        // 关键修复：
+        // 碰撞发生时直接记录当前飞刀“世界坐标命中点”，再转为轮盘本地坐标挂载，
+        // 可以保证飞刀成为轮盘子节点后持续保持相对位置，不会出现漂移。
+        this.currentKnife.getWorldPosition(this.tempA);
+        this.wheel.inverseTransformPoint(this.tempC, this.tempA);
+        this.currentKnife.setParent(this.wheel, false);
+        this.currentKnife.setPosition(this.tempC);
+
+        // 修复“命中瞬间刀尖刀柄反转”：
+        // 以附着点相对轮盘中心的角度为基准，并使用可配置偏移值。
+        // 默认 +90 度对应“刀尖朝向轮盘中心”的常见美术朝向；若资源朝向不同可在 Inspector 调整。
+        const localRad = Math.atan2(this.tempC.y, this.tempC.x);
+        this.currentKnife.angle = localRad * (180 / Math.PI) + this.attachedKnifeAngleOffset;
+
+        this.attachedKnives.push(this.currentKnife);
+        this.currentKnife = null;
+
+        this.hitKnifeCount += 1;
+        this.refreshProgressText();
+
+        if (this.hitKnifeCount >= this.targetKnifeCount) {
+            this.winRound();
+            return;
+        }
+
+        // 命中成功后立即生成新待发飞刀，回到等待点击状态。
+        this.spawnWaitingKnife();
+        this.roundState = RoundState.Idle;
+    }
+
+    private winRound() {
+        this.roundState = RoundState.RoundWin;
+        if (this.winPanel) {
+            this.winPanel.active = true;
+        }
+        this.inputLockedUntil = this.elapsedSeconds + 0.1;
+    }
+
+    private failRound(destroyCurrentKnife = true) {
+        this.roundState = RoundState.RoundFail;
+
+        // 失败分两类：
+        // 1) 撞老飞刀失败：保留新飞刀（destroyCurrentKnife = false）；
+        // 2) 其它失败（越界/异常）：清理新飞刀（destroyCurrentKnife = true）。
+        if (destroyCurrentKnife && this.currentKnife && this.currentKnife.isValid) {
+            this.currentKnife.destroy();
+        }
+
+        // 当需要“失败瞬间保留失误飞刀”时，把它登记到 failedDisplayKnives，
+        // 这样玩家能看到失误反馈，同时又能保证下一局开始时被统一清理。
+        if (!destroyCurrentKnife && this.currentKnife && this.currentKnife.isValid) {
+            this.failedDisplayKnives.push(this.currentKnife);
+
+            // 失败画面阶段不再需要该飞刀参与碰撞，先禁用其 Collider2D，
+            // 避免后续界面动画或误触发导致额外碰撞计算。
+            const knifeCollider = this.getKnifeCollider(this.currentKnife);
+            if (knifeCollider) {
+                knifeCollider.enabled = false;
+            }
+        }
+
+        // 无论是否销毁，都把 currentKnife 引用置空，确保状态机进入失败后不会继续驱动该飞刀。
+        this.currentKnife = null;
+
+        if (this.failPanel) {
+            this.failPanel.active = true;
+        }
+        this.inputLockedUntil = this.elapsedSeconds + 0.1;
+    }
+
+    private refreshProgressText() {
+        if (!this.progressLabel) {
+            return;
+        }
+        this.progressLabel.string = `${this.hitKnifeCount}/${this.targetKnifeCount}`;
+    }
+}
