@@ -195,6 +195,8 @@
       "__id__": 0
     },
     "fileId": "06jdHq+etNAqcrxGT39be9",
+    "instance": null,
+    "targetOverrides": null,
     "nestedPrefabInstanceRoots": null
   },
   {
@@ -251,13 +253,8 @@
     "_points": [
       {
         "__type__": "cc.Vec2",
-        "x": -15.9,
-        "y": -153
-      },
-      {
-        "__type__": "cc.Vec2",
-        "x": -31.1,
-        "y": -36.2
+        "x": -11.6,
+        "y": -42.8
       },
       {
         "__type__": "cc.Vec2",
@@ -266,13 +263,8 @@
       },
       {
         "__type__": "cc.Vec2",
-        "x": 26,
-        "y": -40.3
-      },
-      {
-        "__type__": "cc.Vec2",
-        "x": 10.8,
-        "y": -149
+        "x": 4.8,
+        "y": -43
       }
     ],
     "_id": ""

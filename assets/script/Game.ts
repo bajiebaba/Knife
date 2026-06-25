@@ -10,6 +10,9 @@ import {
     Vec3,
     Label,
     Collider2D,
+    PolygonCollider2D,
+    Tween,
+    tween,
 } from 'cc';
 const { ccclass, property } = _decorator;
 
@@ -70,6 +73,15 @@ export class Game extends Component {
     @property({ tooltip: '飞刀附着后的角度偏移（度），默认 90 可避免刀尖刀柄反转' })
     public attachedKnifeAngleOffset = 90;
 
+    @property({ tooltip: '飞刀命中轮盘时，上下微抖动幅度（像素）' })
+    public wheelHitShakeDistance = 10;
+
+    @property({ tooltip: '飞刀命中轮盘时，每个半程抖动耗时（秒）' })
+    public wheelHitShakeHalfDuration = 0.03;
+
+    @property({ tooltip: '飞刀命中轮盘时，抖动往返次数（越大越急促）' })
+    public wheelHitShakeRepeatCount = 2;
+
     private roundState: RoundState = RoundState.Idle;
     private currentKnife: Node | null = null;
     private attachedKnives: Node[] = [];
@@ -87,6 +99,10 @@ export class Game extends Component {
     private readonly tempA = new Vec3();
     private readonly tempB = new Vec3();
     private readonly tempC = new Vec3();
+    private readonly wheelBaseLocalPos = new Vec3();
+    private readonly wheelShakeUpLocalPos = new Vec3();
+    private readonly wheelShakeDownLocalPos = new Vec3();
+    private wheelBasePosCached = false;
 
     start() {
         this.bindInputEvents();
@@ -139,6 +155,7 @@ export class Game extends Component {
             return;
         }
         this.cacheColliders();
+        this.cacheWheelBaseLocalPosition();
 
         // 1) 清理旧局残留的飞刀（包括正在飞行和已附着）。
         if (this.currentKnife && this.currentKnife.isValid) {
@@ -162,6 +179,9 @@ export class Game extends Component {
         this.hitKnifeCount = 0;
         this.roundState = RoundState.Idle;
         if (this.wheel) {
+            // 开新局时先停止上一局可能未结束的抖动，再复位到“设计稿中的原始位置”。
+            // 这样可避免连续命中导致 tween 累积，把轮盘慢慢推离初始位置。
+            this.resetWheelToBasePosition(true);
             this.wheel.angle = 0;
         }
         if (this.winPanel) {
@@ -224,26 +244,126 @@ export class Game extends Component {
         return knife.getComponent(Collider2D);
     }
 
+    private getKnifePolygonCollider(knife: Node | null): PolygonCollider2D | null {
+        if (!knife || !knife.isValid) {
+            return null;
+        }
+        return knife.getComponent(PolygonCollider2D);
+    }
+
     private isColliderOverlap(a: Collider2D | null, b: Collider2D | null): boolean {
         if (!a || !b || !a.enabledInHierarchy || !b.enabledInHierarchy) {
             return false;
         }
+
+        // 对“非飞刀 vs 飞刀”场景沿用 AABB 快速判定（例如飞刀 vs 轮盘）：
+        // 本次需求只要求飞刀之间必须走 PolygonCollider2D 规则，
+        // 这里保留旧逻辑作为通用/兜底路径，避免影响其他碰撞链路。
         return a.worldAABB.intersects(b.worldAABB);
     }
 
-    private checkKnifeHitAttachedByCollider(): boolean {
-        const flyingKnifeCollider = this.getKnifeCollider(this.currentKnife);
-        if (!flyingKnifeCollider) {
+    private projectPolygonOnAxis(points: ReadonlyArray<{ x: number; y: number }>, axisX: number, axisY: number): { min: number; max: number } {
+        let min = Number.POSITIVE_INFINITY;
+        let max = Number.NEGATIVE_INFINITY;
+        for (const point of points) {
+            const projection = point.x * axisX + point.y * axisY;
+            if (projection < min) {
+                min = projection;
+            }
+            if (projection > max) {
+                max = projection;
+            }
+        }
+        return { min, max };
+    }
+
+    private isPolygonSeparatedByAxis(
+        pointsA: ReadonlyArray<{ x: number; y: number }>,
+        pointsB: ReadonlyArray<{ x: number; y: number }>,
+        axisX: number,
+        axisY: number,
+    ): boolean {
+        const projectionA = this.projectPolygonOnAxis(pointsA, axisX, axisY);
+        const projectionB = this.projectPolygonOnAxis(pointsB, axisX, axisY);
+        return projectionA.max < projectionB.min || projectionB.max < projectionA.min;
+    }
+
+    private hasAnySeparatingAxis(
+        sourcePolygon: ReadonlyArray<{ x: number; y: number }>,
+        otherPolygon: ReadonlyArray<{ x: number; y: number }>,
+    ): boolean {
+        for (let i = 0; i < sourcePolygon.length; i += 1) {
+            const pointA = sourcePolygon[i];
+            const pointB = sourcePolygon[(i + 1) % sourcePolygon.length];
+            const edgeX = pointB.x - pointA.x;
+            const edgeY = pointB.y - pointA.y;
+
+            // 轴取边的法线方向，利用 SAT（Separating Axis Theorem）判断两多边形是否可分离。
+            const axisX = -edgeY;
+            const axisY = edgeX;
+            const axisLengthSquared = axisX * axisX + axisY * axisY;
+            if (axisLengthSquared <= Number.EPSILON) {
+                continue;
+            }
+
+            if (this.isPolygonSeparatedByAxis(sourcePolygon, otherPolygon, axisX, axisY)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private isPolygonOverlapBySAT(
+        pointsA: ReadonlyArray<{ x: number; y: number }>,
+        pointsB: ReadonlyArray<{ x: number; y: number }>,
+    ): boolean {
+        if (pointsA.length < 3 || pointsB.length < 3) {
+            return false;
+        }
+        if (this.hasAnySeparatingAxis(pointsA, pointsB)) {
+            return false;
+        }
+        if (this.hasAnySeparatingAxis(pointsB, pointsA)) {
+            return false;
+        }
+        return true;
+    }
+
+    private isKnifePolygonColliderOverlap(a: PolygonCollider2D | null, b: PolygonCollider2D | null): boolean {
+        if (!a || !b || !a.enabledInHierarchy || !b.enabledInHierarchy) {
             return false;
         }
 
-        // 使用对象自身 Collider2D 做判定：只要“当前飞刀”与任意已附着飞刀的碰撞盒发生交叠，即判定失败。
+        // 关键逻辑：
+        // 直接使用 PolygonCollider2D 的 worldPoints（即多边形在世界坐标系下的顶点）
+        // 进行 SAT 相交检测。这样“飞刀 vs 飞刀”的碰撞结果由多边形轮廓决定，
+        // 与编辑器里 PolygonCollider2D 调整出的形状保持一致。
+        return this.isPolygonOverlapBySAT(a.worldPoints, b.worldPoints);
+    }
+
+    private checkKnifeHitAttachedByCollider(): boolean {
+        // 明确要求：飞刀之间的判定应按 PolygonCollider2D 规则进行。
+        // 因此这里对“当前飞刀”先做一次显式校验，便于在资源配置错误时快速定位问题。
+        const flyingKnifePolygonCollider = this.getKnifePolygonCollider(this.currentKnife);
+        if (!flyingKnifePolygonCollider) {
+            console.warn('[Game] 当前飞刀缺少 PolygonCollider2D，飞刀间碰撞无法按多边形规则判定。');
+            return false;
+        }
+
+        // 使用对象自身 Collider2D 做判定：只要“当前飞刀”与任意已附着飞刀发生接触，即判定失败。
+        // 这里明确走 isKnifePolygonColliderOverlap（SAT + worldPoints），
+        // 确保飞刀之间严格按 PolygonCollider2D 的形状规则判定。
         for (const attachedKnife of this.attachedKnives) {
             if (!attachedKnife || !attachedKnife.isValid) {
                 continue;
             }
-            const attachedKnifeCollider = this.getKnifeCollider(attachedKnife);
-            if (this.isColliderOverlap(flyingKnifeCollider, attachedKnifeCollider)) {
+            const attachedKnifePolygonCollider = this.getKnifePolygonCollider(attachedKnife);
+            if (!attachedKnifePolygonCollider) {
+                // 已附着飞刀如果没挂 PolygonCollider2D，会破坏“飞刀 vs 飞刀”统一规则，给出明确告警。
+                console.warn('[Game] 已附着飞刀缺少 PolygonCollider2D，飞刀间碰撞无法按多边形规则判定。');
+                continue;
+            }
+            if (this.isKnifePolygonColliderOverlap(flyingKnifePolygonCollider, attachedKnifePolygonCollider)) {
                 return true;
             }
         }
@@ -309,10 +429,94 @@ export class Game extends Component {
         return impossibleHitX && currWorldPos.y >= this.tempC.y;
     }
 
+    private cacheWheelBaseLocalPosition() {
+        if (!this.wheel || this.wheelBasePosCached) {
+            return;
+        }
+        this.wheel.getPosition(this.wheelBaseLocalPos);
+        this.wheelBasePosCached = true;
+    }
+
+    private resetWheelToBasePosition(stopShakeTween = true) {
+        if (!this.wheel) {
+            return;
+        }
+        this.cacheWheelBaseLocalPosition();
+        if (!this.wheelBasePosCached) {
+            return;
+        }
+
+        // 统一“轮盘归位”入口，避免不同调用方重复写停止 tween / 复位坐标逻辑。
+        if (stopShakeTween) {
+            Tween.stopAllByTarget(this.wheel);
+        }
+        // 强制回到缓存的初始本地坐标，确保抖动结束后位置绝对一致。
+        this.wheel.setPosition(this.wheelBaseLocalPos);
+    }
+
+    private playWheelHitShake(onComplete?: () => void) {
+        if (!this.wheel) {
+            onComplete?.();
+            return;
+        }
+        this.cacheWheelBaseLocalPosition();
+        if (!this.wheelBasePosCached) {
+            onComplete?.();
+            return;
+        }
+
+        const shakeDistance = Math.max(0, this.wheelHitShakeDistance);
+        const halfDuration = Math.max(0.01, this.wheelHitShakeHalfDuration);
+        const repeatCount = Math.max(1, Math.floor(this.wheelHitShakeRepeatCount));
+        if (shakeDistance <= Number.EPSILON) {
+            this.resetWheelToBasePosition(true);
+            onComplete?.();
+            return;
+        }
+
+        // 命中触发是高频事件（玩家可能快速连击）：
+        // 每次命中先“清掉上一次尚未完成的抖动”并复位基准点，
+        // 再从同一起点播放新的急促抖动，避免多个 tween 并发导致位移漂移和视觉拉扯。
+        this.resetWheelToBasePosition(true);
+
+        this.wheelShakeUpLocalPos.set(
+            this.wheelBaseLocalPos.x,
+            this.wheelBaseLocalPos.y + shakeDistance,
+            this.wheelBaseLocalPos.z,
+        );
+        this.wheelShakeDownLocalPos.set(
+            this.wheelBaseLocalPos.x,
+            this.wheelBaseLocalPos.y - shakeDistance,
+            this.wheelBaseLocalPos.z,
+        );
+
+        let shakeTween = tween(this.wheel);
+        for (let i = 0; i < repeatCount; i += 1) {
+            // 第一段先往上提，第二段压到下方，形成“急促受击感”。
+            shakeTween = shakeTween
+                .to(halfDuration, { position: this.wheelShakeUpLocalPos })
+                .to(halfDuration, { position: this.wheelShakeDownLocalPos });
+        }
+        // 尾段先插值回基准点，再回调里“强制归位”一次：
+        // 即使存在浮点误差或外部打断，也能保证最终位置是初始位置。
+        shakeTween
+            .to(halfDuration, { position: this.wheelBaseLocalPos })
+            .call(() => {
+                this.resetWheelToBasePosition(false);
+                onComplete?.();
+            })
+            .start();
+    }
+
     private attachCurrentKnifeToWheelByCurrentWorldPos() {
         if (!this.currentKnife || !this.wheel) {
             return;
         }
+
+        // 新飞刀命中时，如果上一把飞刀的受击抖动尚未结束，轮盘可能正处于上下偏移状态。
+        // 先归位再计算 inverseTransformPoint，确保“飞刀挂到轮盘后的本地坐标”始终基于初始轮盘位置，
+        // 否则随后抖动归位会把刚挂上的飞刀一起带偏，出现命中点视觉漂移。
+        this.resetWheelToBasePosition(true);
 
         // 关键修复：
         // 碰撞发生时直接记录当前飞刀“世界坐标命中点”，再转为轮盘本地坐标挂载，
@@ -335,25 +539,46 @@ export class Game extends Component {
         this.refreshProgressText();
 
         if (this.hitKnifeCount >= this.targetKnifeCount) {
-            this.winRound();
+            // 最后一刀也要完整播放命中反馈：
+            // 先把状态切到胜利，阻止 update 继续驱动飞刀；再等待抖动结束后弹出胜利面板。
+            this.winRound(true);
+            this.playWheelHitShake(() => {
+                if (this.roundState === RoundState.RoundWin) {
+                    this.showWinPanel();
+                }
+            });
             return;
         }
+
+        // 飞刀命中轮盘时增加“急促上下微抖动”反馈，强化打击感。
+        // 使用轮盘本体抖动，已附着飞刀作为其子节点会同步抖动，视觉上更自然。
+        this.playWheelHitShake();
 
         // 命中成功后立即生成新待发飞刀，回到等待点击状态。
         this.spawnWaitingKnife();
         this.roundState = RoundState.Idle;
     }
 
-    private winRound() {
-        this.roundState = RoundState.RoundWin;
+    private showWinPanel() {
         if (this.winPanel) {
             this.winPanel.active = true;
+        }
+    }
+
+    private winRound(waitForCurrentShake = false) {
+        this.roundState = RoundState.RoundWin;
+        if (!waitForCurrentShake) {
+            // 非命中抖动触发的胜利结算，仍然先停抖动并归位，再展示 UI。
+            this.resetWheelToBasePosition(true);
+            this.showWinPanel();
         }
         this.inputLockedUntil = this.elapsedSeconds + 0.1;
     }
 
     private failRound(destroyCurrentKnife = true) {
         this.roundState = RoundState.RoundFail;
+        // 失败结算同样先归位，避免在抖动中定格导致轮盘停在中间偏移位置。
+        this.resetWheelToBasePosition(true);
 
         // 失败分两类：
         // 1) 撞老飞刀失败：保留新飞刀（destroyCurrentKnife = false）；
