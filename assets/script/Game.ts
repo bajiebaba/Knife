@@ -60,6 +60,21 @@ export class Game extends Component {
     @property({ tooltip: '轮盘旋转速度（角度/秒）' })
     public wheelRotateSpeed = 120;
 
+    @property({ tooltip: '是否启用飞刀分布不均导致的轮盘变速' })
+    public wheelImbalanceEnabled = true;
+
+    @property({ tooltip: '轮盘因为飞刀失衡而受重力影响的程度，0 表示不受影响，数值越大变速越明显' })
+    public wheelImbalanceInfluence = 2.2;
+
+    @property({ tooltip: '飞刀偏心影响下的轮盘最低速度倍率' })
+    public wheelMinSpeedScale = 0.25;
+
+    @property({ tooltip: '飞刀偏心影响下的轮盘最高速度倍率' })
+    public wheelMaxSpeedScale = 1.9;
+
+    @property({ tooltip: '轮盘基础转速回正强度，数值越大越快从重力加减速中回到基础轮速' })
+    public wheelImbalanceSmooth = 1.6;
+
     @property({ tooltip: '飞刀上升速度（像素/秒）' })
     public knifeFlySpeed = 1200;
 
@@ -100,6 +115,7 @@ export class Game extends Component {
     private failedDisplayKnives: Node[] = [];
     private hitKnifeCount = 0;
     private wheelCollider: Collider2D | null = null;
+    private currentWheelRotateSpeed = 0;
 
     // 为了避免“点击继续游戏”后同一触摸事件立刻触发发射，这里增加一个极短输入锁。
     private elapsedSeconds = 0;
@@ -129,7 +145,7 @@ export class Game extends Component {
 
         // 仅在“可进行中”的状态旋转轮盘；结算状态下保持静止，便于玩家看清结果。
         if ((this.roundState === RoundState.Idle || this.roundState === RoundState.KnifeFlying) && this.wheel) {
-            this.wheel.angle += this.wheelRotateSpeed * deltaTime;
+            this.updateWheelRotation(deltaTime);
         }
 
         if (this.roundState === RoundState.KnifeFlying) {
@@ -163,6 +179,96 @@ export class Game extends Component {
         this.startNewRound();
     }
 
+    private clampNumber(value: number, min: number, max: number): number {
+        return Math.min(Math.max(value, min), max);
+    }
+
+    private clampWheelRotateSpeed(speed: number): number {
+        const baseSpeed = this.wheelRotateSpeed;
+        const minSpeedScale = Math.min(this.wheelMinSpeedScale, this.wheelMaxSpeedScale);
+        const maxSpeedScale = Math.max(this.wheelMinSpeedScale, this.wheelMaxSpeedScale);
+        if (Math.abs(baseSpeed) <= Number.EPSILON) {
+            return 0;
+        }
+
+        const direction = baseSpeed >= 0 ? 1 : -1;
+        const speedAbs = Math.abs(speed);
+        const baseSpeedAbs = Math.abs(baseSpeed);
+        const clampedSpeedAbs = this.clampNumber(speedAbs, baseSpeedAbs * minSpeedScale, baseSpeedAbs * maxSpeedScale);
+        return clampedSpeedAbs * direction;
+    }
+
+    private getWheelImbalanceGravityAcceleration(): number {
+        if (!this.wheelImbalanceEnabled || this.attachedKnives.length === 0) {
+            return 0;
+        }
+
+        let centerX = 0;
+        let centerY = 0;
+        let validKnifeCount = 0;
+        for (const knife of this.attachedKnives) {
+            if (!knife || !knife.isValid) {
+                continue;
+            }
+            // 已插入飞刀都是 wheel 的子节点，所以本地坐标可以直接表示它们在轮盘上的分布方向。
+            // 多把飞刀如果分布均匀，向量相加会互相抵消；如果集中在一侧，合向量会明显偏向那一边。
+            centerX += knife.position.x;
+            centerY += knife.position.y;
+            validKnifeCount += 1;
+        }
+        if (validKnifeCount === 0) {
+            return 0;
+        }
+
+        centerX /= validKnifeCount;
+        centerY /= validKnifeCount;
+
+        const imbalanceLength = Math.sqrt(centerX * centerX + centerY * centerY);
+        const normalizedImbalance = this.clampNumber(imbalanceLength / Math.max(1, this.wheelAttachRadius), 0, 1);
+        if (normalizedImbalance <= Number.EPSILON) {
+            return 0;
+        }
+
+        const localImbalanceAngle = Math.atan2(centerY, centerX);
+        const worldImbalanceAngle = localImbalanceAngle + this.wheel.angle * (Math.PI / 180);
+        const influence = Math.max(0, this.wheelImbalanceInfluence);
+
+        // 重力对偏心轮的扭矩近似：
+        // 1) 偏重侧在右侧时，若轮盘按正角速度逆时针旋转，它正处于上升阶段，重力产生反向扭矩 -> 减速；
+        // 2) 偏重侧越过顶点后进入下降阶段，重力产生同向扭矩 -> 加速；
+        // 3) 到达最低点时扭矩接近 0，但当前角速度已被前半段加速，所以会保留“冲过最低点”的惯性；
+        // 4) 过了最低点进入上升阶段后，反向扭矩逐渐增强，速度再自然递减。
+        //
+        // 公式里的 -cos(angle) 来自 2D 力矩 r x F：
+        // r 是偏心质量方向，F 是向下的重力；它能保证“上升减速、下降加速”的相位关系正确。
+        const gravityTorque = -Math.cos(worldImbalanceAngle) * normalizedImbalance * influence;
+
+        // wheelRotateSpeed 是角速度（度/秒），这里乘上它的绝对值构造一个角加速度量级（度/秒^2）。
+        // 这样基础轮速越快，重力扰动也会相应更有存在感；最终仍会被 min/max speed scale 限制住。
+        return gravityTorque * Math.abs(this.wheelRotateSpeed);
+    }
+
+    private updateWheelRotation(deltaTime: number) {
+        if (!this.wheel) {
+            return;
+        }
+
+        const gravityAcceleration = this.getWheelImbalanceGravityAcceleration();
+        this.currentWheelRotateSpeed += gravityAcceleration * deltaTime;
+
+        const restoreStrength = Math.max(0, this.wheelImbalanceSmooth);
+        if (restoreStrength > Number.EPSILON) {
+            // 基础轮速可以理解为轮盘电机/玩法驱动，重力只是在其上叠加加减速。
+            // 用指数回正而不是直接覆盖速度，可以保留过最低点后的惯性，同时避免长期越滚越快。
+            const restoreRatio = 1 - Math.exp(-restoreStrength * deltaTime);
+            this.currentWheelRotateSpeed += (this.wheelRotateSpeed - this.currentWheelRotateSpeed) * restoreRatio;
+        }
+
+        this.currentWheelRotateSpeed = this.clampWheelRotateSpeed(this.currentWheelRotateSpeed);
+
+        this.wheel.angle += this.currentWheelRotateSpeed * deltaTime;
+    }
+
     private startNewRound() {
         if (!this.wheel || !this.knifeSpawnPoint || !this.knifePrefab) {
             console.warn('[Game] 请先在编辑器中绑定 wheel / knifeSpawnPoint / knifePrefab。');
@@ -192,6 +298,7 @@ export class Game extends Component {
 
         // 2) 重置计数、状态、界面可见性。
         this.hitKnifeCount = 0;
+        this.currentWheelRotateSpeed = this.wheelRotateSpeed;
         this.roundState = RoundState.Idle;
         if (this.wheel) {
             // 开新局时先停止上一局可能未结束的抖动，再复位到“设计稿中的原始位置”。
