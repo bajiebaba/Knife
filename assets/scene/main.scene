@@ -330,13 +330,17 @@
     "failContinueButton": {
       "__id__": 23
     },
-    "targetKnifeCount": 8,
-    "wheelRotateSpeed": 120,
-    "knifeFlySpeed": 1200,
-    "wheelAttachRadius": 120,
-    "knifeCollisionRadius": 20,
-    "missYMargin": 120,
+    "targetKnifeCount": 20,
+    "wheelRotateSpeed": 90,
+    "knifeFlySpeed": 1800,
+    "wheelAttachRadius": 50,
     "attachedKnifeAngleOffset": 90,
+    "wheelHitShakeDistance": 10,
+    "wheelHitShakeHalfDuration": 0.03,
+    "wheelHitShakeRepeatCount": 2,
+    "failFocusDuration": 2,
+    "failFocusScale": 1.12,
+    "failKnifeBlinkInterval": 0.15,
     "_id": "ffG2WXT/NN/LSleKrCAWOU"
   },
   {

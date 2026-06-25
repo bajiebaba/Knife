@@ -11,6 +11,8 @@ import {
     Label,
     Collider2D,
     PolygonCollider2D,
+    Sprite,
+    Color,
     Tween,
     tween,
 } from 'cc';
@@ -64,24 +66,32 @@ export class Game extends Component {
     @property({ tooltip: '轮盘附着半径（像素）' })
     public wheelAttachRadius = 120;
 
-    @property({ tooltip: '飞刀碰撞半径（像素）' })
-    public knifeCollisionRadius = 20;
-
-    @property({ tooltip: '飞刀超过轮盘上边缘后的失败冗余距离（像素）' })
-    public missYMargin = 120;
-
+    
+    
     @property({ tooltip: '飞刀附着后的角度偏移（度），默认 90 可避免刀尖刀柄反转' })
     public attachedKnifeAngleOffset = 90;
-
+    
     @property({ tooltip: '飞刀命中轮盘时，上下微抖动幅度（像素）' })
     public wheelHitShakeDistance = 10;
-
+    
     @property({ tooltip: '飞刀命中轮盘时，每个半程抖动耗时（秒）' })
     public wheelHitShakeHalfDuration = 0.03;
-
+    
     @property({ tooltip: '飞刀命中轮盘时，抖动往返次数（越大越急促）' })
     public wheelHitShakeRepeatCount = 2;
-
+    
+    @property({ tooltip: '撞飞刀失败时，慢动作特写和红色闪烁总时长（秒）' })
+    public failFocusDuration = 2;
+    
+    @property({ tooltip: '撞飞刀失败时，慢动作特写放大倍数' })
+    public failFocusScale = 1.12;
+    
+    @property({ tooltip: '撞飞刀失败时，红色闪烁单次切换间隔（秒）' })
+    public failKnifeBlinkInterval = 0.15;
+    
+    public knifeCollisionRadius = 20;
+    private missYMargin = 120;
+    
     private roundState: RoundState = RoundState.Idle;
     private currentKnife: Node | null = null;
     private attachedKnives: Node[] = [];
@@ -102,7 +112,11 @@ export class Game extends Component {
     private readonly wheelBaseLocalPos = new Vec3();
     private readonly wheelShakeUpLocalPos = new Vec3();
     private readonly wheelShakeDownLocalPos = new Vec3();
+    private readonly wheelBaseScale = new Vec3();
+    private readonly failFocusWheelScale = new Vec3();
     private wheelBasePosCached = false;
+    private wheelBaseScaleCached = false;
+    private readonly failBlinkRedColor = new Color(255, 40, 40, 255);
 
     start() {
         this.bindInputEvents();
@@ -156,6 +170,7 @@ export class Game extends Component {
         }
         this.cacheColliders();
         this.cacheWheelBaseLocalPosition();
+        this.cacheWheelBaseScale();
 
         // 1) 清理旧局残留的飞刀（包括正在飞行和已附着）。
         if (this.currentKnife && this.currentKnife.isValid) {
@@ -182,6 +197,7 @@ export class Game extends Component {
             // 开新局时先停止上一局可能未结束的抖动，再复位到“设计稿中的原始位置”。
             // 这样可避免连续命中导致 tween 累积，把轮盘慢慢推离初始位置。
             this.resetWheelToBasePosition(true);
+            this.resetWheelToBaseScale(true);
             this.wheel.angle = 0;
         }
         if (this.winPanel) {
@@ -341,13 +357,13 @@ export class Game extends Component {
         return this.isPolygonOverlapBySAT(a.worldPoints, b.worldPoints);
     }
 
-    private checkKnifeHitAttachedByCollider(): boolean {
+    private getHitAttachedKnifeByCollider(): Node | null {
         // 明确要求：飞刀之间的判定应按 PolygonCollider2D 规则进行。
         // 因此这里对“当前飞刀”先做一次显式校验，便于在资源配置错误时快速定位问题。
         const flyingKnifePolygonCollider = this.getKnifePolygonCollider(this.currentKnife);
         if (!flyingKnifePolygonCollider) {
             console.warn('[Game] 当前飞刀缺少 PolygonCollider2D，飞刀间碰撞无法按多边形规则判定。');
-            return false;
+            return null;
         }
 
         // 使用对象自身 Collider2D 做判定：只要“当前飞刀”与任意已附着飞刀发生接触，即判定失败。
@@ -364,10 +380,10 @@ export class Game extends Component {
                 continue;
             }
             if (this.isKnifePolygonColliderOverlap(flyingKnifePolygonCollider, attachedKnifePolygonCollider)) {
-                return true;
+                return attachedKnife;
             }
         }
-        return false;
+        return null;
     }
 
     private checkKnifeHitWheelByCollider(): boolean {
@@ -394,10 +410,11 @@ export class Game extends Component {
         this.currentKnife.setWorldPosition(this.tempB);
 
         // 按规则优先检查“飞刀撞已附着飞刀”的失败条件。
-        if (this.checkKnifeHitAttachedByCollider()) {
+        const hitAttachedKnife = this.getHitAttachedKnifeByCollider();
+        if (hitAttachedKnife) {
             // 按需求：新飞刀撞到老飞刀时，新飞刀应保留在碰撞瞬间的位置，不做销毁。
             // 这里传 false，进入失败结算但不 destroy 当前飞刀，让画面反馈更直观。
-            this.failRound(false);
+            this.failRound(false, hitAttachedKnife);
             return;
         }
 
@@ -437,6 +454,14 @@ export class Game extends Component {
         this.wheelBasePosCached = true;
     }
 
+    private cacheWheelBaseScale() {
+        if (!this.wheel || this.wheelBaseScaleCached) {
+            return;
+        }
+        this.wheel.getScale(this.wheelBaseScale);
+        this.wheelBaseScaleCached = true;
+    }
+
     private resetWheelToBasePosition(stopShakeTween = true) {
         if (!this.wheel) {
             return;
@@ -452,6 +477,22 @@ export class Game extends Component {
         }
         // 强制回到缓存的初始本地坐标，确保抖动结束后位置绝对一致。
         this.wheel.setPosition(this.wheelBaseLocalPos);
+    }
+
+    private resetWheelToBaseScale(stopScaleTween = true) {
+        if (!this.wheel) {
+            return;
+        }
+        this.cacheWheelBaseScale();
+        if (!this.wheelBaseScaleCached) {
+            return;
+        }
+
+        // 慢动作特写会临时放大轮盘；这里统一负责停掉缩放 tween 并恢复初始缩放。
+        if (stopScaleTween) {
+            Tween.stopAllByTarget(this.wheel);
+        }
+        this.wheel.setScale(this.wheelBaseScale);
     }
 
     private playWheelHitShake(onComplete?: () => void) {
@@ -504,6 +545,123 @@ export class Game extends Component {
             .call(() => {
                 this.resetWheelToBasePosition(false);
                 onComplete?.();
+            })
+            .start();
+    }
+
+    private showFailPanel() {
+        if (this.failPanel) {
+            this.failPanel.active = true;
+        }
+    }
+
+    private setKnifeSpritesColor(knife: Node, color: Color) {
+        const sprites = knife.getComponentsInChildren(Sprite);
+        for (const sprite of sprites) {
+            sprite.color = color;
+        }
+    }
+
+    private collectKnifeSpriteColors(knife: Node): Array<{ sprite: Sprite; color: Color }> {
+        const colors: Array<{ sprite: Sprite; color: Color }> = [];
+        const sprites = knife.getComponentsInChildren(Sprite);
+        for (const sprite of sprites) {
+            const color = sprite.color;
+            colors.push({
+                sprite,
+                color: new Color(color.r, color.g, color.b, color.a),
+            });
+        }
+        return colors;
+    }
+
+    private restoreKnifeSpriteColors(colors: Array<{ sprite: Sprite; color: Color }>) {
+        for (const item of colors) {
+            if (item.sprite && item.sprite.isValid) {
+                item.sprite.color = item.color;
+            }
+        }
+    }
+
+    private playFailFocusEffect(collidedKnives: Node[]) {
+        const validCollidedKnives = collidedKnives.filter((knife) => knife && knife.isValid);
+        if (validCollidedKnives.length === 0) {
+            this.showFailPanel();
+            return;
+        }
+
+        this.cacheWheelBaseScale();
+        const duration = Math.max(0.1, this.failFocusDuration);
+        const blinkInterval = Math.max(0.05, this.failKnifeBlinkInterval);
+        const focusScale = Math.max(1, this.failFocusScale);
+        const knifeBaseScales = validCollidedKnives.map((knife) => {
+            const scale = new Vec3();
+            knife.getScale(scale);
+            return { knife, scale };
+        });
+        const originalSpriteColors: Array<{ sprite: Sprite; color: Color }> = [];
+        for (const knife of validCollidedKnives) {
+            originalSpriteColors.push(...this.collectKnifeSpriteColors(knife));
+        }
+
+        // “慢动作特写”用轻微放大来表现：轮盘和两把碰撞飞刀同步放大，形成镜头靠近的视觉反馈。
+        // 这里仍保持逻辑状态为 RoundFail，游戏输入和飞刀运动都已经停住，玩家能清楚看到失败原因。
+        if (this.wheel && this.wheelBaseScaleCached) {
+            this.failFocusWheelScale.set(
+                this.wheelBaseScale.x * focusScale,
+                this.wheelBaseScale.y * focusScale,
+                this.wheelBaseScale.z,
+            );
+            tween(this.wheel).to(0.25, { scale: this.failFocusWheelScale }).start();
+        }
+        for (const item of knifeBaseScales) {
+            const focusKnifeScale = new Vec3();
+            focusKnifeScale.set(
+                item.scale.x * focusScale,
+                item.scale.y * focusScale,
+                item.scale.z,
+            );
+            tween(item.knife).to(0.25, { scale: focusKnifeScale }).start();
+        }
+
+        const blinkTimes = Math.max(1, Math.floor(duration / blinkInterval));
+        let blinkTween = tween(this.node);
+        for (let i = 0; i < blinkTimes; i += 1) {
+            blinkTween = blinkTween
+                .call(() => {
+                    if (i % 2 === 0) {
+                        for (const knife of validCollidedKnives) {
+                            if (knife.isValid) {
+                                this.setKnifeSpritesColor(knife, this.failBlinkRedColor);
+                            }
+                        }
+                    } else {
+                        this.restoreKnifeSpriteColors(originalSpriteColors);
+                    }
+                })
+                .delay(blinkInterval);
+        }
+
+        blinkTween
+            .call(() => {
+                for (const item of knifeBaseScales) {
+                    if (item.knife.isValid) {
+                        item.knife.setScale(item.scale);
+                    }
+                }
+                if (this.wheel && this.wheelBaseScaleCached) {
+                    this.wheel.setScale(this.wheelBaseScale);
+                }
+                this.restoreKnifeSpriteColors(originalSpriteColors);
+                for (const knife of validCollidedKnives) {
+                    if (knife.isValid) {
+                        // 闪烁结束后把两把碰撞飞刀都定格为红色，失败面板弹出时仍能一眼看到碰撞双方。
+                        this.setKnifeSpritesColor(knife, this.failBlinkRedColor);
+                    }
+                }
+                if (this.roundState === RoundState.RoundFail) {
+                    this.showFailPanel();
+                }
             })
             .start();
     }
@@ -575,10 +733,13 @@ export class Game extends Component {
         this.inputLockedUntil = this.elapsedSeconds + 0.1;
     }
 
-    private failRound(destroyCurrentKnife = true) {
+    private failRound(destroyCurrentKnife = true, hitAttachedKnife: Node | null = null) {
         this.roundState = RoundState.RoundFail;
         // 失败结算同样先归位，避免在抖动中定格导致轮盘停在中间偏移位置。
         this.resetWheelToBasePosition(true);
+        this.resetWheelToBaseScale(true);
+
+        const failedFlyingKnife = !destroyCurrentKnife && this.currentKnife && this.currentKnife.isValid ? this.currentKnife : null;
 
         // 失败分两类：
         // 1) 撞老飞刀失败：保留新飞刀（destroyCurrentKnife = false）；
@@ -603,9 +764,15 @@ export class Game extends Component {
         // 无论是否销毁，都把 currentKnife 引用置空，确保状态机进入失败后不会继续驱动该飞刀。
         this.currentKnife = null;
 
-        if (this.failPanel) {
-            this.failPanel.active = true;
+        if (failedFlyingKnife) {
+            // 撞飞刀失败时不立刻弹失败面板：
+            // 先播放慢动作特写和红色闪烁，让玩家明确看到是哪两把飞刀发生碰撞。
+            this.inputLockedUntil = this.elapsedSeconds + this.failFocusDuration + 0.1;
+            this.playFailFocusEffect([failedFlyingKnife, hitAttachedKnife].filter((knife): knife is Node => !!knife));
+            return;
         }
+
+        this.showFailPanel();
         this.inputLockedUntil = this.elapsedSeconds + 0.1;
     }
 
