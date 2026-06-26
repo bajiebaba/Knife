@@ -70,15 +70,6 @@ export class WheelController extends Component {
     @property({ tooltip: '飞刀命中轮盘时，抖动往返次数（越大越急促）' })
     public wheelHitShakeRepeatCount = 2;
 
-    @property({ tooltip: '轮盘是否在屏幕左右方向来回移动' })
-    public horizontalMoveEnabled = true;
-
-    @property({ tooltip: '轮盘左右往返移动的半幅距离（像素）' })
-    public horizontalMoveDistance = 220;
-
-    @property({ tooltip: '轮盘左右往返移动一整周期耗时（秒）' })
-    public horizontalMovePeriod = 3.5;
-
     @property({ tooltip: '失败特写：镜头推近并居中事故焦点的耗时（秒）' })
     public failFocusMoveDuration = 0.35;
 
@@ -86,7 +77,7 @@ export class WheelController extends Component {
     private wheelCollider: Collider2D | null = null;
     private currentWheelRotateSpeed = 0;
 
-    /** 外层：挂载 WheelController 的根节点，负责左右移动 */
+    /** 外层：挂载 WheelController 的根节点 */
     private outerNode: Node | null = null;
     /** 特写层：失败慢镜头缩放，位于 outer 与 middle 之间 */
     private focusNode: Node | null = null;
@@ -110,9 +101,8 @@ export class WheelController extends Component {
     private readonly wheelBaseScale = new Vec3();
     private wheelBasePosCached = false;
     private wheelBaseScaleCached = false;
-    private horizontalMoveElapsed = 0;
     private hitShakeOffsetY = 0;
-    /** 命中抖动 tween 的独立目标，避免 stopAllByTarget(outer/middle) 误伤左右移动 */
+    /** 命中抖动 tween 的独立目标 */
     private readonly hitShakeTweenTarget = { offsetY: 0 };
     /** 飞刀立正 tween 目标（按实例复用，避免与 node.angle 直接 tween 产生大角绕圈） */
     private readonly knifeAlignTweenTarget = { angle: 0 };
@@ -151,7 +141,6 @@ export class WheelController extends Component {
             this.middleNode.angle = 0;
         }
         this.currentWheelRotateSpeed = this.wheelRotateSpeed;
-        this.horizontalMoveElapsed = 0;
         this.hitShakeOffsetY = 0;
 
         for (const knife of this.attachedKnives) {
@@ -163,8 +152,6 @@ export class WheelController extends Component {
     }
 
     public updateWheelRotation(deltaTime: number) {
-        this.updateHorizontalMovement(deltaTime);
-
         const gravityAcceleration = this.getWheelImbalanceGravityAcceleration();
         this.currentWheelRotateSpeed += gravityAcceleration * deltaTime;
 
@@ -180,18 +167,6 @@ export class WheelController extends Component {
         if (this.middleNode) {
             this.middleNode.angle += this.currentWheelRotateSpeed * deltaTime;
         }
-    }
-
-    private updateHorizontalMovement(deltaTime: number) {
-        this.cacheBaseLocalPosition();
-        if (!this.wheelBasePosCached) {
-            return;
-        }
-
-        if (this.horizontalMoveEnabled) {
-            this.horizontalMoveElapsed += deltaTime;
-        }
-        this.applyWheelLocalPosition();
     }
 
     public checkKnifeHitWheel(knife: Node | null): boolean {
@@ -228,7 +203,7 @@ export class WheelController extends Component {
     }
 
     public attachKnifeAtCurrentWorldPosition(knife: Node) {
-        // 挂载前只复位中间层抖动，不能重置外层左右移动相位。
+        // 挂载前只复位中间层抖动；轮盘组位置由 WheelGroupPathController 统一驱动。
         this.resetWheelShake(true);
         this.ensureWheelHierarchy();
         const attachParent = this.middleNode ?? this.node;
@@ -623,8 +598,8 @@ export class WheelController extends Component {
     }
 
     public playHitShake(onComplete?: () => void) {
-        this.cacheBaseLocalPosition();
-        if (!this.wheelBasePosCached) {
+        this.ensureWheelHierarchy();
+        if (!this.middleNode) {
             onComplete?.();
             return;
         }
@@ -638,7 +613,6 @@ export class WheelController extends Component {
             return;
         }
 
-        // 每次命中只复位中间层抖动，外层左右移动继续按当前相位推进。
         this.resetWheelShake(true);
 
         this.wheelShakeUpLocalPos.set(0, shakeDistance, 0);
@@ -764,7 +738,7 @@ export class WheelController extends Component {
         this.resetWheelToBaseScale(true);
     }
 
-    /** 失败特写前：只复位抖动与缩放，保留 outer 当前水平位置，避免特写前跳帧 */
+    /** 失败特写前：只复位抖动与缩放，保留当前位置，避免特写前跳帧 */
     public stopTweensAndResetForFailFocus() {
         this.resetWheelShake(true);
         this.resetWheelToBaseScale(true);
@@ -996,43 +970,19 @@ export class WheelController extends Component {
         this.applyMiddleShakePosition();
     }
 
-    /** 复位外层位置（含左右移动相位）与中间层抖动，用于新回合/结算归位 */
+    /** 复位中间层命中抖动（轮盘组位置由 WheelGroupPathController 管理，此处不改 outer 坐标） */
     public resetWheelToBasePosition(stopShakeTween = true) {
         this.ensureWheelHierarchy();
-        this.cacheBaseLocalPosition();
-        if (!this.wheelBasePosCached) {
-            return;
-        }
-
         const outerNode = this.outerNode ?? this.node;
         if (stopShakeTween) {
             Tween.stopAllByTarget(outerNode);
         }
         this.resetWheelShake(stopShakeTween);
-        this.horizontalMoveElapsed = 0;
-        this.applyOuterLocalPosition();
     }
 
     private updateHitShakeOffset(offsetY: number) {
         this.hitShakeOffsetY = offsetY;
         this.applyMiddleShakePosition();
-    }
-
-    /** 外层只负责基准位置 + 左右往返偏移，不再叠加抖动 Y 偏移 */
-    private applyOuterLocalPosition() {
-        if (!this.wheelBasePosCached) {
-            return;
-        }
-
-        const outerNode = this.outerNode ?? this.node;
-        const period = Math.max(0.01, this.horizontalMovePeriod);
-        const movePhase = this.horizontalMoveEnabled ? (this.horizontalMoveElapsed / period) * Math.PI * 2 : 0;
-        const moveOffsetX = this.horizontalMoveEnabled ? Math.sin(movePhase) * Math.max(0, this.horizontalMoveDistance) : 0;
-        outerNode.setPosition(
-            this.wheelBaseLocalPos.x + moveOffsetX,
-            this.wheelBaseLocalPos.y,
-            this.wheelBaseLocalPos.z,
-        );
     }
 
     /** 中间层只负责命中上下抖动，本地 X/Z 保持为 0 */
@@ -1041,11 +991,6 @@ export class WheelController extends Component {
             return;
         }
         this.middleNode.setPosition(0, this.hitShakeOffsetY, 0);
-    }
-
-    /** 兼容旧调用名：左右移动走外层位置刷新 */
-    private applyWheelLocalPosition() {
-        this.applyOuterLocalPosition();
     }
 
     public resetWheelToBaseScale(stopScaleTween = true) {
@@ -1066,7 +1011,7 @@ export class WheelController extends Component {
 
     /**
      * 确保轮盘四层结构存在：
-     * - 外层（this.node）：左右移动
+     * - 外层（this.node）：轮盘根节点
      * - 特写层（focus）：失败慢镜头缩放
      * - 中间层（middle）：自转、命中抖动
      * - 内层（body）：视觉与碰撞体

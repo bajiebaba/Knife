@@ -13,6 +13,7 @@ import {
     view,
 } from 'cc';
 import { WheelController } from './WheelController';
+import { WheelGroupPathController } from './WheelGroupPathController';
 const { ccclass, property } = _decorator;
 
 enum RoundState {
@@ -22,10 +23,18 @@ enum RoundState {
     RoundFail = 'RoundFail',
 }
 
+/** 飞刀与某一轮盘的交互结果（用于多轮盘碰撞分发） */
+type FlyingKnifeWheelInteraction =
+    | { type: 'attached'; wheelController: WheelController; attachedKnife: Node }
+    | { type: 'wheel'; wheelController: WheelController };
+
 @ccclass('Game')
 export class Game extends Component {
-    @property({ type: Node, tooltip: '上半屏中间的轮盘节点' })
-    public wheel: Node | null = null;
+    @property({ type: Node, tooltip: '轮盘容器 gp_wheel：其直接子节点为各轮盘，并挂 WheelGroupPathController' })
+    public wheelsRoot: Node | null = null;
+
+    @property({ type: Node, tooltip: '轨迹节点组 gp_path：子节点顺序即贪吃蛇移动路径' })
+    public pathRoot: Node | null = null;
 
     @property({ type: Node, tooltip: '下半屏中间的飞刀出生点节点' })
     public knifeSpawnPoint: Node | null = null;
@@ -62,19 +71,22 @@ export class Game extends Component {
 
     @property({ tooltip: '撞飞刀失败时，慢动作特写和红色闪烁总时长（秒）' })
     public failFocusDuration = 2;
-    
+
     @property({ tooltip: '撞飞刀失败时，慢动作特写放大倍数' })
     public failFocusScale = 1.12;
-    
+
     @property({ tooltip: '撞飞刀失败时，红色闪烁单次切换间隔（秒）' })
     public failKnifeBlinkInterval = 0.15;
-    
+
     private knifeScreenDestroyMargin = 120;
-    
+
     private roundState: RoundState = RoundState.Idle;
     private currentKnife: Node | null = null;
     private flyingKnives: Node[] = [];
-    private wheelController: WheelController | null = null;
+    /** 场景中所有有效轮盘控制器（每颗轮盘各自维护旋转/附着逻辑） */
+    private readonly wheelControllers: WheelController[] = [];
+    /** 轮盘组轨迹控制器：驱动 gp_wheel 下各轮盘沿 gp_path 有序移动 */
+    private wheelGroupPathController: WheelGroupPathController | null = null;
     // 仅用于“失败瞬间保留失误飞刀显示”：
     // 这些节点会在下一局开始时统一销毁，避免跨局残留污染场景。
     private failedDisplayKnives: Node[] = [];
@@ -91,16 +103,19 @@ export class Game extends Component {
 
     start() {
         this.bindInputEvents();
-        this.cacheWheelController();
+        this.cacheWheelControllers();
         this.startNewRound();
     }
 
     update(deltaTime: number) {
         this.elapsedSeconds += deltaTime;
 
-        // 仅在“可进行中”的状态旋转轮盘；结算状态下保持静止，便于玩家看清结果。
-        if ((this.roundState === RoundState.Idle || this.roundState === RoundState.KnifeFlying) && this.wheelController) {
-            this.wheelController.updateWheelRotation(deltaTime);
+        // 先更新轮盘组轨迹，再更新各轮盘自转；结算状态下保持静止。
+        if (this.roundState === RoundState.Idle || this.roundState === RoundState.KnifeFlying) {
+            this.wheelGroupPathController?.updateMovement(deltaTime);
+            for (const wheelController of this.wheelControllers) {
+                wheelController.updateWheelRotation(deltaTime);
+            }
         }
 
         if (this.roundState === RoundState.Idle || this.roundState === RoundState.KnifeFlying) {
@@ -135,22 +150,49 @@ export class Game extends Component {
         this.startNewRound();
     }
 
-    private cacheWheelController() {
-        if (!this.wheel || !this.wheel.isValid) {
-            this.wheelController = null;
-            return;
+    /**
+     * 收集轮盘控制器，并确保 gp_wheel 上存在轨迹控制器。
+     */
+    private cacheWheelControllers() {
+        this.wheelControllers.length = 0;
+
+        if (this.wheelsRoot && this.wheelsRoot.isValid) {
+            for (const child of this.wheelsRoot.children) {
+                if (!child || !child.isValid || !child.active) {
+                    continue;
+                }
+                const controller = child.getComponent(WheelController) ?? child.addComponent(WheelController);
+                controller.initialize();
+                this.wheelControllers.push(controller);
+            }
+
+            this.wheelGroupPathController = this.ensureWheelGroupPathController();
+            this.wheelGroupPathController?.initialize();
+        }
+    }
+
+    /** 在 gp_wheel 上获取或创建 WheelGroupPathController，并绑定 gp_path */
+    private ensureWheelGroupPathController(): WheelGroupPathController | null {
+        if (!this.wheelsRoot || !this.wheelsRoot.isValid) {
+            return null;
         }
 
-        // 兼容当前场景：如果轮盘节点还没有手动挂 WheelController，运行时自动补一个。
-        // 后续支持多个轮盘时，推荐直接在每个轮盘节点上挂该组件并分别配置参数。
-        this.wheelController = this.wheel.getComponent(WheelController) ?? this.wheel.addComponent(WheelController);
-        this.wheelController.initialize();
+        let controller = this.wheelsRoot.getComponent(WheelGroupPathController);
+        if (!controller) {
+            controller = this.wheelsRoot.addComponent(WheelGroupPathController);
+        }
+
+        if (this.pathRoot && this.pathRoot.isValid) {
+            controller.pathRoot = this.pathRoot;
+        }
+
+        return controller;
     }
 
     private startNewRound() {
-        this.cacheWheelController();
-        if (!this.wheelController || !this.knifeSpawnPoint || !this.knifePrefab) {
-            console.warn('[Game] 请先在编辑器中绑定 wheel / knifeSpawnPoint / knifePrefab。');
+        this.cacheWheelControllers();
+        if (this.wheelControllers.length === 0 || !this.knifeSpawnPoint || !this.knifePrefab) {
+            console.warn('[Game] 请先在编辑器中绑定 wheelsRoot / pathRoot / knifeSpawnPoint / knifePrefab。');
             return;
         }
 
@@ -165,13 +207,16 @@ export class Game extends Component {
             }
         }
         this.flyingKnives.length = 0;
-        this.wheelController.resetForNewRound();
+        for (const wheelController of this.wheelControllers) {
+            wheelController.resetForNewRound();
+        }
         for (const knife of this.failedDisplayKnives) {
             if (knife && knife.isValid) {
                 knife.destroy();
             }
         }
         this.failedDisplayKnives.length = 0;
+        this.wheelGroupPathController?.resetToStart();
 
         // 2) 重置计数、状态、界面可见性。
         this.hitKnifeCount = 0;
@@ -240,8 +285,37 @@ export class Game extends Component {
         return knife.getComponent(Collider2D);
     }
 
+    /**
+     * 遍历所有轮盘，检测飞刀当前帧的交互：
+     * 1) 优先判定“撞已附着飞刀”（失败）；
+     * 2) 再判定“命中轮盘本体”（得分附着）。
+     */
+    private findFlyingKnifeWheelInteraction(flyingKnife: Node): FlyingKnifeWheelInteraction | null {
+        for (const wheelController of this.wheelControllers) {
+            const hitAttachedKnife = wheelController.getHitAttachedKnifeByCollider(flyingKnife);
+            if (hitAttachedKnife) {
+                return {
+                    type: 'attached',
+                    wheelController,
+                    attachedKnife: hitAttachedKnife,
+                };
+            }
+        }
+
+        for (const wheelController of this.wheelControllers) {
+            if (wheelController.checkKnifeHitWheel(flyingKnife)) {
+                return {
+                    type: 'wheel',
+                    wheelController,
+                };
+            }
+        }
+
+        return null;
+    }
+
     private updateFlyingKnives(deltaTime: number) {
-        if (!this.wheelController) {
+        if (this.wheelControllers.length === 0) {
             this.failRound();
             return;
         }
@@ -259,19 +333,18 @@ export class Game extends Component {
             this.tempB.y += this.knifeFlySpeed * deltaTime;
             flyingKnife.setWorldPosition(this.tempB);
 
-            // 按规则优先检查“飞刀撞已附着飞刀”的失败条件。
-            const hitAttachedKnife = this.wheelController.getHitAttachedKnifeByCollider(flyingKnife);
-            if (hitAttachedKnife) {
-                // 撞到已附着飞刀时保留失误飞刀，进入失败特写。
+            const interaction = this.findFlyingKnifeWheelInteraction(flyingKnife);
+            if (interaction?.type === 'attached') {
+                // 撞到已附着飞刀时保留失误飞刀，进入失败特写（仅作用于发生碰撞的那颗轮盘）。
                 this.flyingKnives.splice(i, 1);
-                this.failRound(false, hitAttachedKnife, flyingKnife);
+                this.failRound(false, interaction.attachedKnife, flyingKnife, interaction.wheelController);
                 return;
             }
 
-            // 再检查“飞刀撞轮盘”的成功条件，命中后立刻附着到对应轮盘。
-            if (this.wheelController.checkKnifeHitWheel(flyingKnife)) {
+            if (interaction?.type === 'wheel') {
+                // 命中任一轮盘均有效得分，飞刀附着到对应轮盘。
                 this.flyingKnives.splice(i, 1);
-                this.attachFlyingKnifeToWheelByCurrentWorldPos(flyingKnife);
+                this.attachFlyingKnifeToWheel(flyingKnife, interaction.wheelController);
                 if (this.roundState === RoundState.RoundWin) {
                     return;
                 }
@@ -301,12 +374,12 @@ export class Game extends Component {
         }
     }
 
-    private attachFlyingKnifeToWheelByCurrentWorldPos(flyingKnife: Node) {
-        if (!flyingKnife || !flyingKnife.isValid || !this.wheelController) {
+    private attachFlyingKnifeToWheel(flyingKnife: Node, wheelController: WheelController) {
+        if (!flyingKnife || !flyingKnife.isValid) {
             return;
         }
 
-        this.wheelController.attachKnifeAtCurrentWorldPosition(flyingKnife);
+        wheelController.attachKnifeAtCurrentWorldPosition(flyingKnife);
 
         this.hitKnifeCount += 1;
         this.refreshProgressText();
@@ -315,7 +388,7 @@ export class Game extends Component {
             // 最后一刀也要完整播放命中反馈：
             // 先把状态切到胜利，阻止 update 继续驱动飞刀；再等待抖动结束后弹出胜利面板。
             this.winRound(true);
-            this.wheelController.playHitShake(() => {
+            wheelController.playHitShake(() => {
                 if (this.roundState === RoundState.RoundWin) {
                     this.showWinPanel();
                 }
@@ -324,8 +397,7 @@ export class Game extends Component {
         }
 
         // 飞刀命中轮盘时增加“急促上下微抖动”反馈，强化打击感。
-        // 使用轮盘本体抖动，已附着飞刀作为其子节点会同步抖动，视觉上更自然。
-        this.wheelController.playHitShake();
+        wheelController.playHitShake();
 
         if (this.flyingKnives.length === 0) {
             this.roundState = RoundState.Idle;
@@ -352,30 +424,41 @@ export class Game extends Component {
         this.currentKnife = null;
         if (!waitForCurrentShake) {
             // 非命中抖动触发的胜利结算，仍然先停抖动并归位，再展示 UI。
-            this.wheelController?.resetWheelToBasePosition(true);
+            for (const wheelController of this.wheelControllers) {
+                wheelController.resetWheelToBasePosition(true);
+            }
             this.showWinPanel();
         }
         this.inputLockedUntil = this.elapsedSeconds + 0.1;
     }
 
-    private failRound(destroyCurrentKnife = true, hitAttachedKnife: Node | null = null, failedFlyingKnife: Node | null = null) {
+    private failRound(
+        destroyCurrentKnife = true,
+        hitAttachedKnife: Node | null = null,
+        failedFlyingKnife: Node | null = null,
+        hitWheelController: WheelController | null = null,
+    ) {
         this.roundState = RoundState.RoundFail;
+        this.wheelGroupPathController?.pauseMovement();
 
         const failFocusKnives = [failedFlyingKnife, hitAttachedKnife].filter(
             (knife): knife is Node => !!knife && knife.isValid,
         );
 
-        // 先把碰撞飞刀挂到 middle，再归位轮盘；否则轮盘位移/缩放与新飞刀不在同一层级树，特写会不同步。
-        if (failFocusKnives.length > 0) {
-            this.wheelController?.prepareFailFocusKnives(failFocusKnives);
+        // 失败特写只作用于发生碰撞的那颗轮盘；其余轮盘保持当前姿态定格。
+        if (failFocusKnives.length > 0 && hitWheelController) {
+            // 特写前先提到队尾渲染，避免被蛇身其它轮盘遮挡。
+            this.wheelGroupPathController?.bringWheelToRenderFront(hitWheelController.node);
+            hitWheelController.prepareFailFocusKnives(failFocusKnives);
         }
 
-        // 失败结算同样先归位，避免在抖动中定格导致轮盘停在中间偏移位置。
-        if (failFocusKnives.length > 0) {
-            // 失败特写前保留水平位置，只复位抖动与缩放，避免归位瞬间跳帧。
-            this.wheelController?.stopTweensAndResetForFailFocus();
+        if (failFocusKnives.length > 0 && hitWheelController) {
+            // 失败特写前保留当前位置，只复位抖动与缩放，避免归位瞬间跳帧。
+            hitWheelController.stopTweensAndResetForFailFocus();
         } else {
-            this.wheelController?.stopTweensAndResetTransform();
+            for (const wheelController of this.wheelControllers) {
+                wheelController.stopTweensAndResetTransform();
+            }
         }
 
         // 失败分两类：
@@ -418,15 +501,11 @@ export class Game extends Component {
         }
         this.currentKnife = null;
 
-        if (failedFlyingKnife) {
+        if (failedFlyingKnife && hitWheelController) {
             // 撞飞刀失败时不立刻弹失败面板：
             // 先播放慢动作特写和红色闪烁，让玩家明确看到是哪两把飞刀发生碰撞。
             this.inputLockedUntil = this.elapsedSeconds + this.failFocusDuration + 0.1;
-            if (!this.wheelController) {
-                this.showFailPanel();
-                return;
-            }
-            this.wheelController.playFailFocusEffect(
+            hitWheelController.playFailFocusEffect(
                 failFocusKnives,
                 this.failFocusDuration,
                 this.failFocusScale,
